@@ -9,6 +9,10 @@ import "@/utils/walkie"
 LOG_FILE="$CORE_CACHE/install_ai.log"
 OPENCODE_DATA_DIR="$HOME/.local/share/core-termux-data/opencode"
 
+OPENCODE_NPM_PACKAGE="@opencode/cli"
+OPENCODE_ARCHIVE="opencode-linux-arm64.tar.gz"
+OPENCODE_BIN_BASE_URL="https://opencode.ai/files/bin"
+
 _opencode_detect_ubuntu_root() {
   local root
   root="$(find /data/data/com.termux -maxdepth 10 -type d \
@@ -30,8 +34,24 @@ _opencode_proot_ubuntu() {
 }
 
 _get_latest_opencode_version() {
-  curl -fsSL https://api.github.com/repos/anomalyco/opencode/releases/latest |
-    grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+  curl -fsSL "https://registry.npmjs.org/$OPENCODE_NPM_PACKAGE/latest" 2>/dev/null |
+    sed -E 's/.*"version":"([^"]+)".*/\1/'
+}
+
+_opencode_archive_url() {
+  echo "$OPENCODE_BIN_BASE_URL/$1/$OPENCODE_ARCHIVE"
+}
+
+_resolve_opencode_version() {
+  local version
+  version=$(_get_latest_opencode_version)
+
+  if [ -z "$version" ]; then
+    log_error "Failed to resolve the latest $OPENCODE_NPM_PACKAGE version"
+    return 1
+  fi
+
+  echo "$version"
 }
 
 _opencode_install_deps_native() {
@@ -61,6 +81,7 @@ _opencode_install_deps_native_impl() {
     ["nodejs-lts"]="node"
     ["curl"]="curl"
     ["tar"]="tar"
+    ["patchelf"]="patchelf"
   )
 
   local pkg_name bin_name
@@ -82,29 +103,26 @@ _download_opencode_binary() {
 }
 
 _download_opencode_binary_impl() {
-  local latest_version
-  latest_version=$(_get_latest_opencode_version)
-  if [ -z "$latest_version" ]; then
-    log_error "Failed to fetch latest OpenCode version"
-    return 1
-  fi
+  local version
+  version=$(_resolve_opencode_version) || return 1
+
+  local url
+  url=$(_opencode_archive_url "$version")
 
   mkdir -p "$OPENCODE_DATA_DIR"
 
-  local tarball="opencode-linux-arm64.tar.gz"
-  local download_url="https://github.com/anomalyco/opencode/releases/download/$latest_version/$tarball"
-
-  if ! curl -fsSL "$download_url" -o "$OPENCODE_DATA_DIR/$tarball" &>>"$LOG_FILE"; then
-    log_error "Failed to download OpenCode binary"
+  if ! curl -fsSL "$url" -o "$OPENCODE_DATA_DIR/$OPENCODE_ARCHIVE" &>>"$LOG_FILE"; then
+    log_error "Failed to download OpenCode $version"
+    log_info "URL: $url"
     return 1
   fi
 
-  if ! tar -zxf "$OPENCODE_DATA_DIR/$tarball" -C "$OPENCODE_DATA_DIR" &>>"$LOG_FILE"; then
+  if ! tar -zxf "$OPENCODE_DATA_DIR/$OPENCODE_ARCHIVE" -C "$OPENCODE_DATA_DIR" &>>"$LOG_FILE"; then
     log_error "Failed to extract OpenCode binary"
     return 1
   fi
 
-  rm -f "$OPENCODE_DATA_DIR/$tarball"
+  rm -f "$OPENCODE_DATA_DIR/$OPENCODE_ARCHIVE"
 
   if [ ! -f "$OPENCODE_DATA_DIR/opencode" ]; then
     log_error "OpenCode binary not found after extraction"
@@ -112,6 +130,19 @@ _download_opencode_binary_impl() {
   fi
 
   chmod +x "$OPENCODE_DATA_DIR/opencode"
+
+  if ! patchelf --set-interpreter "$PREFIX/glibc/lib/ld-linux-aarch64.so.1" \
+    "$OPENCODE_DATA_DIR/opencode" &>>"$LOG_FILE"; then
+    log_error "Failed to patch opencode ELF interpreter"
+    return 1
+  fi
+
+  rm -rf "$OPENCODE_DATA_DIR/libs"
+  mkdir -p "$OPENCODE_DATA_DIR/libs"
+  for lib in libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0; do
+    ln -sf "$PREFIX/glibc/lib/$lib" "$OPENCODE_DATA_DIR/libs/$lib" &>>"$LOG_FILE"
+  done
+
   return 0
 }
 
@@ -215,12 +246,23 @@ _opencode_ubuntu_deps() {
 }
 
 _opencode_ubuntu_install_bin() {
-  _opencode_proot_ubuntu /bin/bash -c '
-		export SHELL=/bin/bash
-		export TMPDIR=/tmp
-		export HOME=/root
-		curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-	' &>>"$LOG_FILE"
+  local version
+  version=$(_resolve_opencode_version) || return 1
+
+  local url
+  url=$(_opencode_archive_url "$version")
+
+  _opencode_proot_ubuntu /bin/bash -c "
+    set -e
+    export SHELL=/bin/bash
+    export TMPDIR=/tmp
+    export HOME=/root
+    mkdir -p /root/.opencode/bin
+    curl -fsSL '$url' -o /tmp/$OPENCODE_ARCHIVE
+    tar -zxf /tmp/$OPENCODE_ARCHIVE -C /root/.opencode/bin
+    chmod +x /root/.opencode/bin/opencode
+    rm -f /tmp/$OPENCODE_ARCHIVE
+  " &>>"$LOG_FILE"
 
   local opencode_bin
   opencode_bin="$(_opencode_detect_ubuntu_root)/root/.opencode/bin/opencode"
@@ -255,7 +297,16 @@ _opencode_create_ubuntu_wrapper() {
 
 install_opencode() {
   if command -v opencode &>/dev/null; then
-    log_info "OpenCode is already installed"
+    local installed
+    installed="$(_get_installed_version opencode)"
+
+    if [[ "$installed" == 1.* ]]; then
+      log_warn "OpenCode $installed is installed, but this module installs OpenCode 2.x"
+      log_info "Run: core update ai --opencode"
+    else
+      log_info "OpenCode is already installed"
+    fi
+
     return 2
   fi
 
@@ -351,18 +402,13 @@ _update_opencode_impl() {
 }
 
 update_opencode() {
-  _check_update_needed "OpenCode" "$(_get_installed_version opencode)" "$(_get_remote_github_version anomalyco/opencode)" _update_opencode
+  _check_update_needed "OpenCode" "$(_get_installed_version opencode)" "$(_get_remote_npm_version "$OPENCODE_NPM_PACKAGE")" _update_opencode
 }
 
 _update_opencode_proot_impl() {
   _opencode_proot_ubuntu /bin/bash -c 'rm -rf /root/.opencode' &>>"$LOG_FILE"
 
-  _opencode_proot_ubuntu /bin/bash -c '
-		export SHELL=/bin/bash
-		export TMPDIR=/tmp
-		export HOME=/root
-		curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
-	' &>>"$LOG_FILE"
+  _opencode_ubuntu_install_bin || return 1
 
   local ubuntu_root
   ubuntu_root="$(_opencode_detect_ubuntu_root)"
